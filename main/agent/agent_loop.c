@@ -8,6 +8,8 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_random.h"
@@ -123,6 +125,7 @@ static void agent_loop_task(void *arg)
 
         while (iteration < MIMI_AGENT_MAX_TOOL_ITER) {
             /* Send "working" indicator before each API call */
+#if MIMI_AGENT_SEND_WORKING_STATUS
             {
                 static const char *working_phrases[] = {
                     "mimi\xF0\x9F\x98\x97is working...",
@@ -136,8 +139,14 @@ static void agent_loop_task(void *arg)
                 strncpy(status.channel, msg.channel, sizeof(status.channel) - 1);
                 strncpy(status.chat_id, msg.chat_id, sizeof(status.chat_id) - 1);
                 status.content = strdup(working_phrases[esp_random() % phrase_count]);
-                if (status.content) message_bus_push_outbound(&status);
+                if (status.content) {
+                    if (message_bus_push_outbound(&status) != ESP_OK) {
+                        ESP_LOGW(TAG, "Outbound queue full, drop working status");
+                        free(status.content);
+                    }
+                }
             }
+#endif
 
             llm_response_t resp;
             err = llm_chat_tools(system_prompt, messages, tools_json, &resp);
@@ -188,7 +197,14 @@ static void agent_loop_task(void *arg)
             strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
             strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
             out.content = final_text;  /* transfer ownership */
-            message_bus_push_outbound(&out);
+            ESP_LOGI(TAG, "Queue final response to %s:%s (%d bytes)",
+                     out.channel, out.chat_id, (int)strlen(final_text));
+            if (message_bus_push_outbound(&out) != ESP_OK) {
+                ESP_LOGW(TAG, "Outbound queue full, drop final response");
+                free(final_text);
+            } else {
+                final_text = NULL;
+            }
         } else {
             /* Error or empty response */
             free(final_text);
@@ -197,7 +213,10 @@ static void agent_loop_task(void *arg)
             strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
             out.content = strdup("Sorry, I encountered an error.");
             if (out.content) {
-                message_bus_push_outbound(&out);
+                if (message_bus_push_outbound(&out) != ESP_OK) {
+                    ESP_LOGW(TAG, "Outbound queue full, drop error response");
+                    free(out.content);
+                }
             }
         }
 
@@ -218,10 +237,32 @@ esp_err_t agent_loop_init(void)
 
 esp_err_t agent_loop_start(void)
 {
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        agent_loop_task, "agent_loop",
-        MIMI_AGENT_STACK, NULL,
-        MIMI_AGENT_PRIO, NULL, MIMI_AGENT_CORE);
+    const uint32_t stack_candidates[] = {
+        MIMI_AGENT_STACK,
+        20 * 1024,
+        16 * 1024,
+        14 * 1024,
+        12 * 1024,
+    };
 
-    return (ret == pdPASS) ? ESP_OK : ESP_FAIL;
+    for (size_t i = 0; i < (sizeof(stack_candidates) / sizeof(stack_candidates[0])); i++) {
+        uint32_t stack_size = stack_candidates[i];
+        BaseType_t ret = xTaskCreatePinnedToCore(
+            agent_loop_task, "agent_loop",
+            stack_size, NULL,
+            MIMI_AGENT_PRIO, NULL, MIMI_AGENT_CORE);
+
+        if (ret == pdPASS) {
+            ESP_LOGI(TAG, "agent_loop task created with stack=%u bytes", (unsigned)stack_size);
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG,
+                 "agent_loop create failed (stack=%u, free_internal=%u, largest_internal=%u), retrying...",
+                 (unsigned)stack_size,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+
+    return ESP_FAIL;
 }
